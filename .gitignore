@@ -1,0 +1,19 @@
+# Ignore Python virtual environment
+venv/
+.venv/
+
+# Ignore Python compiled/cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore all user profiles and sensitive credentials
+profiles/*
+
+# Keep the profile directory structure explanation file
+!profiles/structure.txt
+
+# Ignore environment files
+.env
+*.env
+.env.*

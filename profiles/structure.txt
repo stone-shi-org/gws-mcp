@@ -1,0 +1,20 @@
+Google Workspace MCP - Profiles Directory Structure
+
+The 'profiles' directory contains subdirectories representing isolated configuration
+profiles (e.g. 'default', 'stone', 'work'). 
+
+Each profile directory should follow this layout:
+
+profiles/
+└── <profile_name>/
+    ├── .env                     # Contains profile token (CALENDAR_PROFILE_TOKEN) 
+    │                            # and optionally a GOOGLE_MAPS_API_KEY.
+    ├── google_cli_client.json   # Google Cloud Platform Desktop client secrets.
+    ├── google_calendar_token.json # Generated Google API OAuth credentials.
+    └── cache/                   # Cache folder for downloaded Google Drive files.
+                                 # (Contains downloaded files mapped by Drive ID
+                                 # along with their metadata JSON files).
+
+Note:
+All sensitive files (.env, google_cli_client.json, google_calendar_token.json, cache/)
+are ignored by Git. Only this explanation file (structure.txt) is tracked.

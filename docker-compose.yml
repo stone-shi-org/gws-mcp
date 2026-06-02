@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  gwsmcp:
+    build: .
+    container_name: gwsmcp
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./profiles:/app/profiles
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - DEFAULT_PROFILE=default
+    restart: unless-stopped
