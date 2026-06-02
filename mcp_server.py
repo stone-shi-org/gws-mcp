@@ -96,8 +96,8 @@ def get_profile_credentials(profile_name: str) -> Credentials:
                 with open(creds_full) as f:
                     client_info = json.load(f)
                     client_type = "installed" if "installed" in client_info else "web"
-                    creds.client_id = client_info[client_type]["client_id"]
-                    creds.client_secret = client_info[client_type]["client_secret"]
+                    creds._client_id = client_info[client_type]["client_id"]
+                    creds._client_secret = client_info[client_type]["client_secret"]
             creds.refresh(GoogleAuthRequest())
             with open(token_full, "w") as f:
                 f.write(creds.to_json())

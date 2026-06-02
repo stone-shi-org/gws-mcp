@@ -126,11 +126,16 @@ Once established, MCP messages are sent as client requests to `POST http://local
 *   `google_drive_upload_file(local_file_path: str, name: str = None, parent_id: str = None)`: Upload a local file.
 *   `google_drive_download_file(file_id: str, use_cache: bool = True)`: Download a file to cache and returns local filepath.
     *   *Note: Files are cached locally under `profiles/<profile_name>/cache/` based on file ID, matching size, and MD5 checksum.*
+*   `google_drive_create_folder(name: str, parent_id: str = None)`: Create a folder in Drive.
+*   `google_drive_copy_file(file_id: str, name: str = None, parent_id: str = None)`: Copy a file in Drive.
 
 ### Google Docs
 *   `google_docs_get_document(document_id: str)`: Read the plain text of a Doc.
 *   `google_docs_create_document(title: str)`: Create a new Document.
 *   `google_docs_append_text(document_id: str, text: str)`: Append text to a Doc.
+*   `google_docs_format_text(document_id: str, text_to_format: str, bold: bool, italic: bool, underline: bool, font_size: float)`: Format specific text occurrences inside the document.
+*   `google_docs_render_to_markdown(document_id: str)`: Read a Document and render its structural content to Markdown formatting.
+*   `google_docs_create_from_markdown(title: str, markdown: str)`: Create a new Document from a Markdown string, translating formatting to Doc elements.
 
 ### Google Sheets
 *   `google_sheets_get_spreadsheet(spreadsheet_id: str, range_name: str)`: Get values from a spreadsheet range.
