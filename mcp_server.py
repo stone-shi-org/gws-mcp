@@ -54,7 +54,7 @@ def get_profile_by_token(token: str) -> Optional[str]:
             env_path = os.path.join(profile_dir, ".env")
             if os.path.exists(env_path):
                 env_vals = dotenv_values(env_path)
-                p_token = env_vals.get("CALENDAR_PROFILE_TOKEN") or env_vals.get("PROFILE_TOKEN")
+                p_token = env_vals.get("PROFILE_TOKEN") or env_vals.get("CALENDAR_PROFILE_TOKEN")
                 if p_token == token:
                     return name
     return None

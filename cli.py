@@ -65,8 +65,8 @@ def generate_token(profile_name):
     if os.path.exists(env_path):
         with open(env_path, "r") as f:
             for line in f:
-                if line.strip().startswith("CALENDAR_PROFILE_TOKEN="):
-                    lines.append(f"CALENDAR_PROFILE_TOKEN={token}\n")
+                if line.strip().startswith("PROFILE_TOKEN=") or line.strip().startswith("CALENDAR_PROFILE_TOKEN="):
+                    lines.append(f"PROFILE_TOKEN={token}\n")
                     token_updated = True
                 else:
                     lines.append(line)
@@ -75,7 +75,7 @@ def generate_token(profile_name):
         # If file doesn't end with newline, append one
         if lines and not lines[-1].endswith("\n"):
             lines.append("\n")
-        lines.append(f"CALENDAR_PROFILE_TOKEN={token}\n")
+        lines.append(f"PROFILE_TOKEN={token}\n")
         
     with open(env_path, "w") as f:
         f.writelines(lines)

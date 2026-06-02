@@ -19,7 +19,7 @@ All settings, Google client secrets, access tokens, and temporary files (like ca
 ```
 profiles/
 ├── <profile_name>/
-│   ├── .env                       # Environment settings containing CALENDAR_PROFILE_TOKEN
+│   ├── .env                       # Environment settings containing PROFILE_TOKEN
 │   ├── google_cli_client.json      # Client Secrets file (from Google Developer Console)
 │   ├── google_calendar_token.json  # Generated Google OAuth token file
 │   └── cache/                     # Temporary Drive files cache folder
@@ -57,7 +57,7 @@ Use the CLI to initialize a profile folder and generate a secure access token:
 ```bash
 python3 cli.py generate-token --profile stone
 ```
-This generates a secure 32-character hex token and saves it as `CALENDAR_PROFILE_TOKEN` inside `profiles/stone/.env`.
+This generates a secure 32-character hex token and saves it as `PROFILE_TOKEN` inside `profiles/stone/.env`.
 
 ### 3. Setup Client Secrets
 Place your downloaded client secrets file at:

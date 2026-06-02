@@ -7,7 +7,7 @@ Each profile directory should follow this layout:
 
 profiles/
 └── <profile_name>/
-    ├── .env                     # Contains profile token (CALENDAR_PROFILE_TOKEN) 
+    ├── .env                     # Contains profile token (PROFILE_TOKEN) 
     │                            # and optionally a GOOGLE_MAPS_API_KEY.
     ├── google_cli_client.json   # Google Cloud Platform Desktop client secrets.
     ├── google_calendar_token.json # Generated Google API OAuth credentials.
