@@ -353,6 +353,66 @@ async def google_drive_upload_file(ctx: Context, local_file_path: str, name: str
         logger.exception("Error uploading file")
         return f"Error: {str(e)}"
 
+@mcp.tool()
+async def google_drive_create_folder(ctx: Context, name: str, parent_id: str = None) -> str:
+    """Create a new folder in Google Drive.
+    
+    Args:
+        name: The name of the new folder.
+        parent_id: Optional ID of the parent folder in Drive.
+    """
+    try:
+        profile_name = await get_profile_name(ctx)
+        creds = get_profile_credentials_with_scope(profile_name, "https://www.googleapis.com/auth/drive")
+        drive_service = build("drive", "v3", credentials=creds)
+        
+        file_metadata = {
+            'name': name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        if parent_id:
+            file_metadata['parents'] = [parent_id]
+            
+        file = drive_service.files().create(body=file_metadata, fields='id, name').execute()
+        return json.dumps({
+            "status": "success",
+            "folder_id": file.get("id"),
+            "name": file.get("name")
+        }, indent=2)
+    except Exception as e:
+        logger.exception("Error creating folder")
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+async def google_drive_copy_file(ctx: Context, file_id: str, name: str = None, parent_id: str = None) -> str:
+    """Copy an existing file in Google Drive.
+    
+    Args:
+        file_id: The ID of the file in Google Drive to copy.
+        name: Optional new name for the copied file.
+        parent_id: Optional ID of the parent folder to place the copy.
+    """
+    try:
+        profile_name = await get_profile_name(ctx)
+        creds = get_profile_credentials_with_scope(profile_name, "https://www.googleapis.com/auth/drive")
+        drive_service = build("drive", "v3", credentials=creds)
+        
+        body = {}
+        if name:
+            body['name'] = name
+        if parent_id:
+            body['parents'] = [parent_id]
+            
+        file = drive_service.files().copy(fileId=file_id, body=body, fields='id, name').execute()
+        return json.dumps({
+            "status": "success",
+            "file_id": file.get("id"),
+            "name": file.get("name")
+        }, indent=2)
+    except Exception as e:
+        logger.exception("Error copying file")
+        return f"Error: {str(e)}"
+
 
 # ==============================================================================
 # Google Docs Tools
@@ -450,6 +510,297 @@ async def google_docs_append_text(ctx: Context, document_id: str, text: str) -> 
         return f"Successfully appended text to document {document_id}"
     except Exception as e:
         logger.exception("Error appending text to document")
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+async def google_docs_format_text(ctx: Context, document_id: str, text_to_format: str, bold: bool = None, italic: bool = None, underline: bool = None, font_size: float = None) -> str:
+    """Format specific text occurrences within a Google Document (bold, italic, underline, size).
+    
+    Args:
+        document_id: The Google Document ID.
+        text_to_format: The specific string to format inside the doc.
+        bold: Optional boolean to set text bold.
+        italic: Optional boolean to set text italic.
+        underline: Optional boolean to set text underline.
+        font_size: Optional font size in points (e.g. 12.0).
+    """
+    try:
+        profile_name = await get_profile_name(ctx)
+        creds = get_profile_credentials_with_scope(profile_name, "https://www.googleapis.com/auth/documents")
+        docs_service = build("docs", "v1", credentials=creds)
+        
+        doc = docs_service.documents().get(documentId=document_id).execute()
+        
+        def find_text_ranges(elements, target_text):
+            ranges = []
+            for value in elements:
+                if 'paragraph' in value:
+                    paras = value.get('paragraph').get('elements')
+                    for elem in paras:
+                        if 'textRun' in elem:
+                            run = elem.get('textRun')
+                            content = run.get('content')
+                            if target_text in content:
+                                start = elem.get('startIndex') + content.index(target_text)
+                                end = start + len(target_text)
+                                ranges.append({'startIndex': start, 'endIndex': end})
+                elif 'table' in value:
+                    table = value.get('table')
+                    for row in table.get('tableRows'):
+                        for cell in row.get('tableCells'):
+                            ranges.extend(find_text_ranges(cell.get('content'), target_text))
+            return ranges
+            
+        ranges = find_text_ranges(doc.get('body').get('content'), text_to_format)
+        if not ranges:
+            return f"Error: Text '{text_to_format}' not found in document."
+            
+        requests = []
+        for r in ranges:
+            fields = []
+            text_style = {}
+            if bold is not None:
+                text_style['bold'] = bold
+                fields.append('bold')
+            if italic is not None:
+                text_style['italic'] = italic
+                fields.append('italic')
+            if underline is not None:
+                text_style['underline'] = underline
+                fields.append('underline')
+            if font_size is not None:
+                text_style['fontSize'] = {'magnitude': font_size, 'unit': 'PT'}
+                fields.append('fontSize')
+                
+            if fields:
+                requests.append({
+                    'updateTextStyle': {
+                        'range': r,
+                        'textStyle': text_style,
+                        'fields': ','.join(fields)
+                    }
+                })
+                
+        if not requests:
+            return "Error: No formatting parameters provided."
+            
+        docs_service.documents().batchUpdate(documentId=document_id, body={'requests': requests}).execute()
+        return f"Successfully formatted {len(ranges)} occurrences of '{text_to_format}' in document {document_id}"
+    except Exception as e:
+        logger.exception("Error formatting text")
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+async def google_docs_render_to_markdown(ctx: Context, document_id: str) -> str:
+    """Read a Google Document and render its structural content to Markdown format.
+    
+    Args:
+        document_id: The document ID.
+    """
+    try:
+        profile_name = await get_profile_name(ctx)
+        creds = get_profile_credentials_with_scope(profile_name, "https://www.googleapis.com/auth/documents")
+        docs_service = build("docs", "v1", credentials=creds)
+        
+        doc = docs_service.documents().get(documentId=document_id).execute()
+        
+        def doc_body_to_markdown(elements_container):
+            markdown = ""
+            elements = elements_container.get('content') if isinstance(elements_container, dict) else elements_container
+            if not elements:
+                return ""
+                
+            for elem in elements:
+                if 'paragraph' in elem:
+                    para = elem.get('paragraph')
+                    para_style = para.get('paragraphStyle', {})
+                    style_name = para_style.get('namedStyleType', 'NORMAL_TEXT')
+                    
+                    bullet = para.get('bullet')
+                    prefix = ""
+                    if bullet:
+                        prefix = "* "
+                        
+                    para_text = ""
+                    for run_elem in para.get('elements', []):
+                        if 'textRun' in run_elem:
+                            run = run_elem.get('textRun')
+                            text = run.get('content', '')
+                            style = run.get('textStyle', {})
+                            
+                            if style.get('bold'):
+                                text = f"**{text.strip()}**" + (" " if text.endswith(" ") else "")
+                            if style.get('italic'):
+                                text = f"*{text.strip()}*" + (" " if text.endswith(" ") else "")
+                            para_text += text
+                            
+                    if not para_text.strip():
+                        continue
+                        
+                    if style_name == 'HEADING_1':
+                        markdown += f"# {para_text.strip()}\n\n"
+                    elif style_name == 'HEADING_2':
+                        markdown += f"## {para_text.strip()}\n\n"
+                    elif style_name == 'HEADING_3':
+                        markdown += f"### {para_text.strip()}\n\n"
+                    else:
+                        markdown += f"{prefix}{para_text.strip()}\n\n"
+                        
+                elif 'table' in elem:
+                    table = elem.get('table')
+                    for row in table.get('tableRows', []):
+                        row_cells = []
+                        for cell in row.get('tableCells', []):
+                            cell_md = doc_body_to_markdown(cell.get('content')).strip()
+                            row_cells.append(cell_md)
+                        markdown += "| " + " | ".join(row_cells) + " |\n"
+                    markdown += "\n"
+            return markdown
+            
+        md_text = doc_body_to_markdown(doc.get('body'))
+        return json.dumps({
+            "title": doc.get("title"),
+            "document_id": document_id,
+            "markdown": md_text
+        }, indent=2)
+    except Exception as e:
+        logger.exception("Error rendering doc to markdown")
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+async def google_docs_create_from_markdown(ctx: Context, title: str, markdown: str) -> str:
+    """Create a new Google Document, rendering Markdown formatting (headings, lists, bold, italics) to Doc elements.
+    
+    Args:
+        title: The title of the new document.
+        markdown: The Markdown formatted string content.
+    """
+    try:
+        profile_name = await get_profile_name(ctx)
+        creds = get_profile_credentials_with_scope(profile_name, "https://www.googleapis.com/auth/documents")
+        docs_service = build("docs", "v1", credentials=creds)
+        
+        # 1. Create empty document
+        doc = docs_service.documents().create(body={'title': title}).execute()
+        document_id = doc.get("documentId")
+        
+        import re
+        requests = []
+        lines = markdown.split('\n')
+        current_index = 1
+        
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                requests.append({
+                    'insertText': {
+                        'location': {'index': current_index},
+                        'text': "\n"
+                    }
+                })
+                current_index += 1
+                continue
+                
+            style_name = 'NORMAL_TEXT'
+            text_content = stripped
+            if stripped.startswith('# '):
+                style_name = 'HEADING_1'
+                text_content = stripped[2:]
+            elif stripped.startswith('## '):
+                style_name = 'HEADING_2'
+                text_content = stripped[3:]
+            elif stripped.startswith('### '):
+                style_name = 'HEADING_3'
+                text_content = stripped[4:]
+            elif stripped.startswith('* ') or stripped.startswith('- '):
+                text_content = "• " + stripped[2:]
+                
+            plain_text = text_content
+            bold_ranges = []
+            italic_ranges = []
+            
+            while True:
+                match = re.search(r'\*\*(.*?)\*\*', plain_text)
+                if not match:
+                    break
+                start = match.start()
+                content = match.group(1)
+                plain_text = plain_text[:start] + content + plain_text[match.end():]
+                bold_ranges.append((start, start + len(content)))
+                
+            while True:
+                match = re.search(r'\*(.*?)\*', plain_text)
+                if not match:
+                    break
+                start = match.start()
+                content = match.group(1)
+                plain_text = plain_text[:start] + content + plain_text[match.end():]
+                italic_ranges.append((start, start + len(content)))
+                
+            plain_text += "\n"
+            length = len(plain_text)
+            
+            # Insert text content
+            requests.append({
+                'insertText': {
+                    'location': {'index': current_index},
+                    'text': plain_text
+                }
+            })
+            
+            # Apply structural paragraph style
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {
+                        'startIndex': current_index,
+                        'endIndex': current_index + length
+                    },
+                    'paragraphStyle': {
+                        'namedStyleType': style_name
+                    },
+                    'fields': 'namedStyleType'
+                }
+            })
+            
+            # Apply inline bold style
+            for start, end in bold_ranges:
+                requests.append({
+                    'updateTextStyle': {
+                        'range': {
+                            'startIndex': current_index + start,
+                            'endIndex': current_index + end
+                        },
+                        'textStyle': {'bold': True},
+                        'fields': 'bold'
+                    }
+                })
+                
+            # Apply inline italic style
+            for start, end in italic_ranges:
+                requests.append({
+                    'updateTextStyle': {
+                        'range': {
+                            'startIndex': current_index + start,
+                            'endIndex': current_index + end
+                        },
+                        'textStyle': {'italic': True},
+                        'fields': 'italic'
+                    }
+                })
+                
+            current_index += length
+            
+        if requests:
+            docs_service.documents().batchUpdate(documentId=document_id, body={'requests': requests}).execute()
+            
+        return json.dumps({
+            "status": "success",
+            "document_id": document_id,
+            "title": title,
+            "message": "Document created from markdown successfully."
+        }, indent=2)
+    except Exception as e:
+        logger.exception("Error creating document from markdown")
         return f"Error: {str(e)}"
 
 
