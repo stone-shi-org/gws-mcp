@@ -21,3 +21,6 @@ profiles/*
 # Ignore version metadata generated at build time
 version.txt
 
+# Ignore test reports
+test-reports/
+

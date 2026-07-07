@@ -1,0 +1,12 @@
+mcp
+fastapi
+uvicorn
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+starlette
+python-dotenv
+httpx
+beautifulsoup4
+pytest
+pytest-asyncio
