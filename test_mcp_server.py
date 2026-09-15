@@ -254,3 +254,19 @@ class TestGetProfileCredentialsWithScope:
         mock_get_creds.return_value = mock_creds
         result = mcp_server.get_profile_credentials_with_scope("test", "https://www.googleapis.com/auth/drive")
         assert result == mock_creds
+
+
+class TestServerInstructions:
+    def test_instructions_constant_is_nonempty_string(self):
+        assert isinstance(mcp_server.SERVER_INSTRUCTIONS, str)
+        assert mcp_server.SERVER_INSTRUCTIONS.strip() != ""
+
+    def test_fastmcp_instance_exposes_instructions(self):
+        # FastMCP.instructions is backed by the low-level Server, which feeds
+        # InitializeResult.instructions in the MCP initialize handshake.
+        assert mcp_server.mcp.instructions == mcp_server.SERVER_INSTRUCTIONS
+
+    def test_instructions_mention_read_before_write_ordering(self):
+        text = mcp_server.SERVER_INSTRUCTIONS
+        assert "google_drive_list_files" in text
+        assert "google_tasks_delete_task" in text

@@ -39,8 +39,38 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar",
 ]
 
+# General usage overview surfaced to clients via InitializeResult.instructions.
+# Keep this concise: it's meant for tiered loading (read this first, then pull
+# per-tool schemas on demand) — not a substitute for individual tool docstrings.
+SERVER_INSTRUCTIONS = """\
+This server provides access to Google Workspace (Drive, Docs, Sheets, Tasks) \
+plus Maps and News utilities, scoped per-session to an authenticated profile.
+
+Recommended tool-call ordering:
+- Call read/list/status tools first to discover valid IDs and current state \
+before calling mutating tools, e.g. google_drive_list_files / \
+google_drive_search_files before google_drive_upload_file / \
+google_drive_copy_file; google_docs_get_document before \
+google_docs_append_text / google_docs_format_text; \
+google_sheets_get_spreadsheet before google_sheets_update_spreadsheet; \
+google_tasks_list_task_lists / google_tasks_list_tasks before \
+google_tasks_create_task / google_tasks_update_task / \
+google_tasks_complete_task / google_tasks_delete_task.
+
+Cross-cutting caveats:
+- Each session must resolve to an authenticated Google profile before any \
+tool call will succeed; unauthenticated calls fail.
+- IDs (file, document, spreadsheet, tasklist, task) should come from the \
+list/search/get tools above, not be guessed.
+- Delete and overwrite operations (e.g. google_tasks_delete_task, \
+google_tasks_delete_task_list, google_drive_upload_file with an existing \
+name) are irreversible — confirm the target with a read/list call first.
+
+See each tool's own schema/docstring for parameter-level details.\
+"""
+
 # Initialize FastMCP
-mcp = FastMCP("Google Workspace MCP Server")
+mcp = FastMCP("Google Workspace MCP Server", instructions=SERVER_INSTRUCTIONS)
 
 # Helper: Find profile by token
 def get_profile_by_token(token: str) -> Optional[str]:

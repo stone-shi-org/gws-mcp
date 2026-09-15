@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies
 RUN pip install --no-cache-dir \
-    mcp \
+    "mcp<2" \
     fastapi \
     uvicorn \
     google-api-python-client \
