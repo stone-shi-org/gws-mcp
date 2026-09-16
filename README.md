@@ -134,6 +134,17 @@ For backwards compatibility with existing clients that use SSE:
 *   `google_drive_upload_file(local_file_path: str, name: str = None, parent_id: str = None)`: Upload a local file.
 *   `google_drive_download_file(file_id: str, use_cache: bool = True)`: Download a file to cache and returns local filepath.
     *   *Note: Files are cached locally under `profiles/<profile_name>/cache/` based on file ID, matching size, and MD5 checksum.*
+*   `google_drive_export_file(file_id: str, export_format: str, use_cache: bool = True)`: Export a Google-Apps-native file (Doc/Sheet/Slide/Drawing/Apps Script) to another format (e.g. PDF, DOCX, XLSX, CSV, PPTX, PNG), and cache the result locally.
+    *   Use this instead of `google_drive_download_file` for files whose `mimeType` starts with `application/vnd.google-apps.*` — those have no raw binary content, so `google_drive_download_file` fails with `403 fileNotDownloadable` on them.
+    *   Supported `export_format` values depend on the source file's type; an unsupported value returns an error listing the valid options for that file. See [Google's export format reference](https://developers.google.com/drive/api/guides/ref-export-formats) for the authoritative, up-to-date list:
+        *   **Docs**: pdf, docx, odt, rtf, txt, html, epub, md
+        *   **Sheets**: pdf, xlsx, ods, csv\*, tsv\*, html
+        *   **Slides**: pdf, pptx, odp, txt, jpeg\*, png\*, svg\*
+        *   **Drawings**: pdf, png, jpeg, svg
+        *   **Apps Script**: json
+        *   \* CSV/TSV (Sheets) and image exports (Slides/Drawings) only cover the first/active sheet or slide — the response includes `single_sheet_or_slide_only: true` as a reminder.
+    *   Drive enforces a hard 10 MB limit on exported output; oversized exports return a clear error suggesting a smaller subset or a lower-fidelity format.
+    *   *Note: Unlike `google_drive_download_file`, exported bytes have no Drive-side checksum, so the cache is keyed on the source document's `modifiedTime` plus the requested format (`profiles/<profile_name>/cache/<file_id>.export.<format>`), not on `file_id` alone.*
 *   `google_drive_create_folder(name: str, parent_id: str = None)`: Create a folder in Drive.
 *   `google_drive_copy_file(file_id: str, name: str = None, parent_id: str = None)`: Copy a file in Drive.
 

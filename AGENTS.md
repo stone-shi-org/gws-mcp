@@ -48,6 +48,7 @@ To maintain stateless multi-profile behavior, we map active connection streams/s
 - The Drive download tool caches files at `profiles/<profile_name>/cache/<file_id>`.
 - Next to each cached file, a JSON metadata file `profiles/<profile_name>/cache/<file_id>.json` stores the file name, size, mimeType, and MD5 checksum from Drive.
 - Before downloading, we compare local cached metadata against live Drive metadata. If it matches, we return the cached file's path instantly.
+- **Deliberate exception**: `google_drive_export_file` (Google-Apps-native file export, e.g. Doc -> PDF) caches at `profiles/<profile_name>/cache/<file_id>.export.<format>` (metadata sidecar: `...<format>.json`) instead of `<file_id>`, and keys its cache-validity check on the *source* document's `modifiedTime` instead of size/MD5. This is intentional, not an oversight — exported bytes have no Drive-side checksum/size to compare against, and the same source file can be exported to multiple formats, so `file_id` alone isn't a safe cache key. Do not "fix" this to match `google_drive_download_file`'s scheme.
 
 ---
 

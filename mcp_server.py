@@ -85,6 +85,89 @@ See each tool's own schema/docstring for parameter-level details.\
 # Initialize FastMCP
 mcp = FastMCP("Google Workspace MCP Server", instructions=SERVER_INSTRUCTIONS)
 
+# Google-Apps-native export support (GM-3): source mimeType -> {friendly
+# format name: target export mimeType}. Used by google_drive_export_file to
+# validate requested formats up front instead of surfacing a raw Drive API
+# error. Keep in sync with Google's published export format list:
+# https://developers.google.com/drive/api/guides/ref-export-formats
+GOOGLE_APPS_EXPORT_FORMATS: Dict[str, Dict[str, str]] = {
+    "application/vnd.google-apps.document": {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "odt": "application/vnd.oasis.opendocument.text",
+        "rtf": "application/rtf",
+        "txt": "text/plain",
+        "html": "application/zip",
+        "epub": "application/epub+zip",
+        "md": "text/markdown",
+    },
+    "application/vnd.google-apps.spreadsheet": {
+        "pdf": "application/pdf",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ods": "application/vnd.oasis.opendocument.spreadsheet",
+        "csv": "text/csv",
+        "tsv": "text/tab-separated-values",
+        "html": "application/zip",
+    },
+    "application/vnd.google-apps.presentation": {
+        "pdf": "application/pdf",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odp": "application/vnd.oasis.opendocument.presentation",
+        "txt": "text/plain",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "svg": "image/svg+xml",
+    },
+    "application/vnd.google-apps.drawing": {
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "jpeg": "image/jpeg",
+        "svg": "image/svg+xml",
+    },
+    "application/vnd.google-apps.script": {
+        "json": "application/vnd.google-apps.script+json",
+    },
+}
+
+# Export formats that only ever cover the first/active sheet or slide (Drive
+# API limitation, not something this server can work around).
+SINGLE_SHEET_OR_SLIDE_FORMATS = {"csv", "tsv", "jpeg", "png", "svg"}
+
+
+def resolve_export_mime_type(source_mime_type: str, export_format: str) -> str:
+    """Validate and resolve a friendly export_format to a Drive export mimeType.
+
+    Args:
+        source_mime_type: The mimeType of the source Drive file.
+        export_format: Friendly target format name, e.g. "pdf", "docx".
+
+    Returns:
+        The Drive export mimeType to pass to files().export_media().
+
+    Raises:
+        ValueError: If source_mime_type is not a Google-Apps-native type, or
+            export_format is not supported for that type. The message lists
+            the valid options.
+    """
+    if not source_mime_type or not source_mime_type.startswith("application/vnd.google-apps."):
+        raise ValueError(
+            f"File has mimeType '{source_mime_type}', which is not a Google-Apps "
+            "native type. Use google_drive_download_file for regular binary files."
+        )
+    formats = GOOGLE_APPS_EXPORT_FORMATS.get(source_mime_type)
+    if not formats:
+        raise ValueError(
+            f"No export formats are known for mimeType '{source_mime_type}'."
+        )
+    target_mime = formats.get(export_format.lower()) if export_format else None
+    if not target_mime:
+        valid = ", ".join(sorted(formats))
+        raise ValueError(
+            f"export_format '{export_format}' is not supported for mimeType "
+            f"'{source_mime_type}'. Valid options: {valid}."
+        )
+    return target_mime
+
 # Helper: Find profile by token
 def get_profile_by_token(token: str) -> Optional[str]:
     profiles_dir = "profiles"
@@ -369,6 +452,128 @@ async def google_drive_download_file(ctx: Context, file_id: str, use_cache: bool
         }, indent=2)
     except Exception as e:
         logger.exception("Error downloading file")
+        return f"Error: {str(e)}"
+
+@mcp.tool()
+async def google_drive_export_file(ctx: Context, file_id: str, export_format: str, use_cache: bool = True) -> str:
+    """Export a Google-Apps-native file (Doc/Sheet/Slide/Drawing/Script) to another format.
+
+    Only works for files whose mimeType starts with
+    'application/vnd.google-apps.'; for regular binary files already stored
+    in Drive, use google_drive_download_file instead.
+
+    Args:
+        file_id: The Google Drive file ID.
+        export_format: Friendly target format, e.g. "pdf", "docx", "xlsx",
+            "csv", "pptx", "png". Valid values depend on the source file's
+            type (Doc/Sheet/Slide/Drawing/Script); an invalid value returns
+            an error listing the valid options for that file.
+        use_cache: If True, reuses a previously exported file when the source
+            document's modifiedTime hasn't changed (default: True).
+
+    Notes:
+        - Drive enforces a hard 10 MB limit on exported output; very large
+          Docs/Sheets/Slides may fail to export at all. Try a smaller subset
+          or a lower-fidelity format (e.g. txt/csv instead of docx/xlsx).
+        - Sheets CSV/TSV export and Slides/Drawings image export
+          (jpeg/png/svg) only cover the first/active sheet or slide; there is
+          no way to select a specific one via this tool.
+    """
+    try:
+        profile_name = await get_profile_name(ctx)
+        creds = get_profile_credentials_with_scope(profile_name, "https://www.googleapis.com/auth/drive")
+        drive_service = build("drive", "v3", credentials=creds)
+
+        # Retrieve live metadata
+        file_meta = drive_service.files().get(
+            fileId=file_id, fields="name, mimeType, modifiedTime"
+        ).execute()
+
+        source_mime_type = file_meta.get("mimeType")
+        file_name = file_meta.get("name")
+        modified_time = file_meta.get("modifiedTime")
+
+        try:
+            target_mime = resolve_export_mime_type(source_mime_type, export_format)
+        except ValueError as ve:
+            return f"Error: {str(ve)}"
+
+        normalized_format = export_format.lower()
+        cache_dir = get_profile_cache_dir(profile_name)
+        cache_key = f"{file_id}.export.{normalized_format}"
+        cached_file_path = os.path.join(cache_dir, cache_key)
+        metadata_path = os.path.join(cache_dir, f"{cache_key}.json")
+
+        is_cached = False
+        if use_cache and os.path.exists(cached_file_path) and os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, "r") as f:
+                    meta = json.load(f)
+                if (meta.get("modifiedTime") == modified_time and
+                    meta.get("export_mime_type") == target_mime and
+                    meta.get("name") == file_name):
+                    is_cached = True
+            except Exception:
+                pass
+
+        if is_cached:
+            return json.dumps({
+                "status": "success",
+                "message": "Exported file retrieved from cache.",
+                "file_name": file_name,
+                "local_path": cached_file_path,
+                "export_mime_type": target_mime,
+                "cached": True,
+                "single_sheet_or_slide_only": normalized_format in SINGLE_SHEET_OR_SLIDE_FORMATS,
+            }, indent=2)
+
+        # Export from API
+        from googleapiclient.errors import HttpError
+        from googleapiclient.http import MediaIoBaseDownload
+        import io
+
+        logger.info(f"Exporting file ID {file_id} to '{normalized_format}' for profile '{profile_name}'")
+        request = drive_service.files().export_media(fileId=file_id, mimeType=target_mime)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        try:
+            while done is False:
+                status, done = downloader.next_chunk()
+        except HttpError as he:
+            error_text = str(he)
+            if "exportSizeLimitExceeded" in error_text or "too large" in error_text.lower():
+                return (
+                    "Error: The exported file would exceed Google Drive's 10 MB export "
+                    "size limit. Try a smaller subset (e.g. a single sheet/tab) or a "
+                    "lower-fidelity format (e.g. txt/csv instead of docx/xlsx)."
+                )
+            raise
+
+        # Write to cache
+        with open(cached_file_path, "wb") as f:
+            f.write(fh.getvalue())
+
+        # Write metadata
+        with open(metadata_path, "w") as f:
+            json.dump({
+                "name": file_name,
+                "mimeType": source_mime_type,
+                "export_mime_type": target_mime,
+                "modifiedTime": modified_time,
+            }, f)
+
+        return json.dumps({
+            "status": "success",
+            "message": "File exported successfully.",
+            "file_name": file_name,
+            "local_path": cached_file_path,
+            "export_mime_type": target_mime,
+            "cached": False,
+            "single_sheet_or_slide_only": normalized_format in SINGLE_SHEET_OR_SLIDE_FORMATS,
+        }, indent=2)
+    except Exception as e:
+        logger.exception("Error exporting file")
         return f"Error: {str(e)}"
 
 @mcp.tool()

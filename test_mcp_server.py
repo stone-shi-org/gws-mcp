@@ -301,6 +301,302 @@ class TestGetProfileCredentialsWithScope:
         assert result == mock_creds
 
 
+class TestResolveExportMimeType:
+    def test_doc_pdf_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.document", "pdf"
+        ) == "application/pdf"
+
+    def test_doc_docx_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.document", "docx"
+        ) == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    def test_doc_txt_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.document", "txt"
+        ) == "text/plain"
+
+    def test_sheet_xlsx_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.spreadsheet", "xlsx"
+        ) == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    def test_sheet_csv_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.spreadsheet", "csv"
+        ) == "text/csv"
+
+    def test_slide_pdf_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.presentation", "pdf"
+        ) == "application/pdf"
+
+    def test_slide_pptx_resolves(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.presentation", "pptx"
+        ) == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+    def test_format_matching_is_case_insensitive(self):
+        assert mcp_server.resolve_export_mime_type(
+            "application/vnd.google-apps.document", "PDF"
+        ) == "application/pdf"
+
+    def test_non_google_apps_mime_type_raises_with_download_hint(self):
+        with pytest.raises(ValueError, match="google_drive_download_file"):
+            mcp_server.resolve_export_mime_type("application/pdf", "pdf")
+
+    def test_unsupported_format_for_valid_type_raises_with_valid_options(self):
+        with pytest.raises(ValueError) as exc_info:
+            mcp_server.resolve_export_mime_type("application/vnd.google-apps.document", "xlsx")
+        assert "docx" in str(exc_info.value)
+        assert "pdf" in str(exc_info.value)
+
+    def test_unknown_google_apps_mime_type_raises(self):
+        with pytest.raises(ValueError, match="No export formats are known"):
+            mcp_server.resolve_export_mime_type("application/vnd.google-apps.folder", "pdf")
+
+
+class TestGoogleDriveExportFile:
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        os.makedirs(os.path.join("profiles", "test_profile"), exist_ok=True)
+
+    def teardown_method(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.test_dir)
+
+    def _mock_ctx(self):
+        mock_ctx = Mock()
+        mock_ctx.request_context.request = None
+        return mock_ctx
+
+    def _mock_drive_service(self, file_meta, export_bytes=b"exported-bytes"):
+        mock_service = MagicMock()
+        mock_service.files.return_value.get.return_value.execute.return_value = file_meta
+        mock_service.files.return_value.export_media.return_value = Mock()
+
+        def fake_media_download(fh, request):
+            fh.write(export_bytes)
+            mock_downloader = Mock()
+            mock_downloader.next_chunk.return_value = (Mock(), True)
+            return mock_downloader
+
+        return mock_service, fake_media_download
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_export_doc_to_pdf_happy_path(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "MyDoc",
+            "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, fake_media_download = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            result = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "pdf")
+
+        del os.environ["DEFAULT_PROFILE"]
+        data = json.loads(result)
+        assert data["status"] == "success"
+        assert data["cached"] is False
+        assert data["export_mime_type"] == "application/pdf"
+        assert data["single_sheet_or_slide_only"] is False
+        mock_service.files.return_value.export_media.assert_called_once_with(
+            fileId="file123", mimeType="application/pdf"
+        )
+        assert os.path.exists(data["local_path"])
+        with open(data["local_path"], "rb") as f:
+            assert f.read() == b"exported-bytes"
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_export_sheet_to_csv_flags_single_sheet_only(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "MySheet",
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, fake_media_download = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            result = await mcp_server.google_drive_export_file(self._mock_ctx(), "sheet123", "csv")
+
+        del os.environ["DEFAULT_PROFILE"]
+        data = json.loads(result)
+        assert data["status"] == "success"
+        assert data["export_mime_type"] == "text/csv"
+        assert data["single_sheet_or_slide_only"] is True
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_export_slides_to_pptx_happy_path(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "MyDeck",
+            "mimeType": "application/vnd.google-apps.presentation",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, fake_media_download = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            result = await mcp_server.google_drive_export_file(self._mock_ctx(), "deck123", "pptx")
+
+        del os.environ["DEFAULT_PROFILE"]
+        data = json.loads(result)
+        assert data["status"] == "success"
+        assert data["export_mime_type"] == (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_export_media_call(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "MyDoc",
+            "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, fake_media_download = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            first = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "pdf")
+        first_data = json.loads(first)
+        assert first_data["cached"] is False
+
+        # Second call: same modifiedTime -> should hit cache without calling export_media again.
+        mock_service.files.return_value.export_media.reset_mock()
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            second = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "pdf")
+
+        del os.environ["DEFAULT_PROFILE"]
+        second_data = json.loads(second)
+        assert second_data["cached"] is True
+        mock_service.files.return_value.export_media.assert_not_called()
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_cache_miss_on_source_modified_time_change(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "MyDoc",
+            "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, fake_media_download = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "pdf")
+
+        # Source doc changed since the export was cached.
+        file_meta["modifiedTime"] = "2026-02-01T00:00:00.000Z"
+        mock_service.files.return_value.export_media.reset_mock()
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            result = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "pdf")
+
+        del os.environ["DEFAULT_PROFILE"]
+        data = json.loads(result)
+        assert data["cached"] is False
+        mock_service.files.return_value.export_media.assert_called_once()
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_unsupported_format_returns_clean_error_without_calling_api(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "MyDoc",
+            "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, _ = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        result = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "xlsx")
+
+        del os.environ["DEFAULT_PROFILE"]
+        assert result.startswith("Error:")
+        assert "xlsx" in result
+        mock_service.files.return_value.export_media.assert_not_called()
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_non_google_apps_file_returns_clean_error(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "regular.bin",
+            "mimeType": "application/octet-stream",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service, _ = self._mock_drive_service(file_meta)
+        mock_build.return_value = mock_service
+
+        result = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "pdf")
+
+        del os.environ["DEFAULT_PROFILE"]
+        assert result.startswith("Error:")
+        assert "google_drive_download_file" in result
+        mock_service.files.return_value.export_media.assert_not_called()
+
+    @patch("mcp_server.get_profile_credentials_with_scope")
+    @patch("mcp_server.build")
+    @pytest.mark.asyncio
+    async def test_export_size_limit_error_is_caught_and_actionable(self, mock_build, mock_get_creds):
+        os.environ["DEFAULT_PROFILE"] = "test_profile"
+        file_meta = {
+            "name": "HugeDoc",
+            "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "2026-01-01T00:00:00.000Z",
+        }
+        mock_service = MagicMock()
+        mock_service.files.return_value.get.return_value.execute.return_value = file_meta
+        mock_service.files.return_value.export_media.return_value = Mock()
+        mock_build.return_value = mock_service
+
+        from googleapiclient.errors import HttpError
+
+        mock_resp = Mock()
+        mock_resp.status = 403
+        # Shaped like a real Drive API error body: top-level "message" plus an
+        # "errors" array carrying the specific reason code.
+        size_limit_error = HttpError(
+            mock_resp,
+            b'{"error": {"code": 403, "message": "This file is too large to be '
+            b'exported.", "errors": [{"domain": "global", "reason": '
+            b'"exportSizeLimitExceeded", "message": "This file is too large to '
+            b'be exported."}]}}',
+        )
+
+        def fake_media_download(fh, request):
+            mock_downloader = Mock()
+            mock_downloader.next_chunk.side_effect = size_limit_error
+            return mock_downloader
+
+        with patch("googleapiclient.http.MediaIoBaseDownload", side_effect=fake_media_download):
+            result = await mcp_server.google_drive_export_file(self._mock_ctx(), "file123", "docx")
+
+        del os.environ["DEFAULT_PROFILE"]
+        assert result.startswith("Error:")
+        assert "10 MB" in result
+
+
 class TestServerInstructions:
     def test_instructions_constant_is_nonempty_string(self):
         assert isinstance(mcp_server.SERVER_INSTRUCTIONS, str)
