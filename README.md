@@ -105,16 +105,24 @@ The server will start listening on `http://0.0.0.0:8000`.
 
 ## Connecting to the Server
 
-Clients must use the **Server-Sent Events (SSE)** transport to connect to the server and pass their profile-specific access token.
+The server supports both **Streamable HTTP** (recommended for modern MCP clients) and **HTTP+SSE** transports running simultaneously on the same port.
 
-*   **Endpoint**: `/sse`
+### 1. Streamable HTTP Transport (Recommended)
+
+Streamable HTTP exposes a unified endpoint for session initialization, bidirectional messaging, and tool invocations:
+
+*   **Endpoint**: `/mcp`
 *   **Authentication**: Pass the token via the `token` query parameter or as an HTTP `Authorization` header:
+    *   **Bearer Header**: `Authorization: Bearer <profile_token>`
+    *   **Query parameter**: `http://localhost:8000/mcp?token=<profile_token>`
+*   **Session Management**: Once initialized, the server responds with an `mcp-session-id` HTTP header. Modern MCP clients automatically include `mcp-session-id: <session_id>` in subsequent requests.
 
-### Examples:
-*   **Query parameter**: `http://localhost:8000/sse?token=4ecaee64898b022cedd9409017fa6b76`
-*   **Bearer Header**: Connect to `http://localhost:8000/sse` with header `Authorization: Bearer 4ecaee64898b022cedd9409017fa6b76`
+### 2. Legacy HTTP+SSE Transport
 
-Once established, MCP messages are sent as client requests to `POST http://localhost:8000/messages?session_id=<session_id>`.
+For backwards compatibility with existing clients that use SSE:
+
+*   **SSE Handshake Endpoint**: `GET /sse` (e.g. `http://localhost:8000/sse?token=<profile_token>` or `Authorization: Bearer <profile_token>`)
+*   **Messages Endpoint**: `POST /messages?session_id=<session_id>`
 
 ---
 

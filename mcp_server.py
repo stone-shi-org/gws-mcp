@@ -5,8 +5,12 @@ import logging
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Optional, List, Dict, Any
+import contextlib
+from typing import Optional, List, Dict, Any, AsyncIterator
+from uuid import uuid4
 
+import anyio
+from anyio.abc import TaskStatus
 import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
@@ -17,7 +21,16 @@ from dotenv import dotenv_values
 
 # MCP SDK
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp.server import StreamableHTTPASGIApp
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import (
+    StreamableHTTPSessionManager,
+    StreamableHTTPServerTransport,
+    MCP_SESSION_ID_HEADER,
+    JSONRPCError,
+    ErrorData,
+    INVALID_REQUEST,
+)
 
 # Google API Client Libraries
 from googleapiclient.discovery import build
@@ -176,6 +189,17 @@ def get_profile_cache_dir(profile_name: str) -> str:
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
+# Helper: Extract profile token from HTTP request
+def extract_token_from_request(request: Request) -> Optional[str]:
+    """Extract profile authentication token from query parameters or Authorization header."""
+    token = request.query_params.get("token")
+    if not token:
+        auth_header = request.headers.get("authorization")
+        if auth_header and auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+    return token
+
+
 # Helper: Extract profile name from MCP Context
 async def get_profile_name(ctx: Context) -> str:
     request = ctx.request_context.request
@@ -184,15 +208,24 @@ async def get_profile_name(ctx: Context) -> str:
         default_profile = os.environ.get("DEFAULT_PROFILE", "default")
         logger.warning(f"No HTTP request context. Falling back to profile '{default_profile}'.")
         return default_profile
-        
-    session_id = request.query_params.get("session_id")
+
+    session_id = None
+    if hasattr(request, "headers"):
+        val = request.headers.get("mcp-session-id")
+        if isinstance(val, str):
+            session_id = val
+    if not session_id and hasattr(request, "query_params"):
+        val = request.query_params.get("session_id")
+        if isinstance(val, str):
+            session_id = val
+
     if not session_id:
-        raise ValueError("Missing 'session_id' in HTTP request query params.")
-        
+        raise ValueError("Missing 'session_id' in HTTP request query params or headers.")
+
     profile_name = session_to_profile.get(session_id)
     if not profile_name:
         raise ValueError(f"Session '{session_id}' is not mapped to any authenticated profile.")
-        
+
     return profile_name
 
 
@@ -1270,20 +1303,14 @@ async def google_news_get_article_text(ctx: Context, url: str) -> str:
 
 
 # ==============================================================================
-# Starlette / SSE Server Configuration
+# Starlette / Transports Server Configuration (SSE & Streamable HTTP)
 # ==============================================================================
 
 # Normalizing message endpoint
 sse_transport = SseServerTransport("/messages/")
 
 async def handle_sse(request: Request):
-    # Retrieve the token
-    token = request.query_params.get("token")
-    if not token:
-        auth_header = request.headers.get("authorization")
-        if auth_header and auth_header.lower().startswith("bearer "):
-            token = auth_header[7:]
-            
+    token = extract_token_from_request(request)
     if not token:
         logger.warning("Rejecting connection request: Missing token")
         return Response("Unauthorized: Missing token", status_code=401)
@@ -1319,18 +1346,177 @@ async def handle_sse(request: Request):
                 
     return Response()
 
+
+class ProfileStreamableHTTPSessionManager(StreamableHTTPSessionManager):
+    """Session manager that authenticates Streamable HTTP connections against profile tokens."""
+
+    @contextlib.asynccontextmanager
+    async def run(self) -> AsyncIterator[None]:
+        async with super().run():
+            try:
+                yield
+            finally:
+                self._has_started = False
+
+    async def _handle_stateful_request(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        request = Request(scope, receive)
+        request_mcp_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
+
+        # Existing session case
+        if request_mcp_session_id is not None and request_mcp_session_id in self._server_instances:
+            session_profile = session_to_profile.get(request_mcp_session_id)
+            if not session_profile:
+                logger.warning(
+                    f"Rejecting Streamable HTTP request: Session '{request_mcp_session_id}' has no mapped profile."
+                )
+                body = JSONRPCError(
+                    jsonrpc="2.0", id="server-error", error=ErrorData(code=INVALID_REQUEST, message="Session not found")
+                )
+                response = Response(
+                    body.model_dump_json(by_alias=True, exclude_none=True),
+                    status_code=404,
+                    media_type="application/json",
+                )
+                await response(scope, receive, send)
+                return
+
+            token = extract_token_from_request(request)
+            if token:
+                token_profile = get_profile_by_token(token)
+                if token_profile != session_profile:
+                    logger.warning("Rejecting Streamable HTTP request: Token does not match session profile.")
+                    response = Response("Unauthorized: Invalid token", status_code=401)
+                    await response(scope, receive, send)
+                    return
+
+            transport = self._server_instances[request_mcp_session_id]
+            if transport.idle_scope is not None and self.session_idle_timeout is not None:
+                transport.idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
+            await transport.handle_request(scope, receive, send)
+            if request.method == "DELETE":
+                session_to_profile.pop(request_mcp_session_id, None)
+                logger.info(f"Cleaned up deleted Streamable HTTP session ID '{request_mcp_session_id}' from profile mappings.")
+            return
+
+        if request_mcp_session_id is None:
+            token = extract_token_from_request(request)
+            if not token:
+                logger.warning("Rejecting Streamable HTTP connection request: Missing token")
+                response = Response("Unauthorized: Missing token", status_code=401)
+                await response(scope, receive, send)
+                return
+
+            profile_name = get_profile_by_token(token)
+            if not profile_name:
+                logger.warning(f"Rejecting Streamable HTTP connection request: Invalid token '{token}'")
+                response = Response("Unauthorized: Invalid token", status_code=401)
+                await response(scope, receive, send)
+                return
+
+            logger.info(f"Token matches profile '{profile_name}'. Establishing Streamable HTTP connection...")
+            async with self._session_creation_lock:
+                new_session_id = uuid4().hex
+                http_transport = StreamableHTTPServerTransport(
+                    mcp_session_id=new_session_id,
+                    is_json_response_enabled=self.json_response,
+                    event_store=self.event_store,
+                    security_settings=self.security_settings,
+                    retry_interval=self.retry_interval,
+                )
+
+                assert http_transport.mcp_session_id is not None
+                self._server_instances[http_transport.mcp_session_id] = http_transport
+                session_to_profile[new_session_id] = profile_name
+                logger.info(f"Associated Streamable HTTP Session ID '{new_session_id}' with profile '{profile_name}'")
+
+                async def run_server(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
+                    async with http_transport.connect() as streams:
+                        read_stream, write_stream = streams
+                        task_status.started()
+                        try:
+                            idle_scope = anyio.CancelScope()
+                            if self.session_idle_timeout is not None:
+                                idle_scope.deadline = anyio.current_time() + self.session_idle_timeout
+                                http_transport.idle_scope = idle_scope
+
+                            with idle_scope:
+                                await self.app.run(
+                                    read_stream,
+                                    write_stream,
+                                    self.app.create_initialization_options(),
+                                    stateless=False,
+                                )
+
+                            if idle_scope.cancelled_caught:
+                                assert http_transport.mcp_session_id is not None
+                                logger.info(f"Streamable HTTP Session {http_transport.mcp_session_id} idle timeout")
+                                self._server_instances.pop(http_transport.mcp_session_id, None)
+                                await http_transport.terminate()
+                        except Exception:
+                            logger.exception(f"Streamable HTTP Session {http_transport.mcp_session_id} crashed")
+                        finally:
+                            session_to_profile.pop(http_transport.mcp_session_id, None)
+                            logger.info(f"Cleaned up Streamable HTTP session ID '{http_transport.mcp_session_id}' from profile mappings.")
+                            if (
+                                http_transport.mcp_session_id
+                                and http_transport.mcp_session_id in self._server_instances
+                                and not http_transport.is_terminated
+                            ):
+                                logger.info(
+                                    "Cleaning up crashed session "
+                                    f"{http_transport.mcp_session_id} from "
+                                    "active instances."
+                                )
+                                del self._server_instances[http_transport.mcp_session_id]
+
+                assert self._task_group is not None
+                await self._task_group.start(run_server)
+                await http_transport.handle_request(scope, receive, send)
+        else:
+            # Unknown or expired session ID - return 404 per MCP spec
+            body = JSONRPCError(
+                jsonrpc="2.0", id="server-error", error=ErrorData(code=INVALID_REQUEST, message="Session not found")
+            )
+            response = Response(
+                body.model_dump_json(by_alias=True, exclude_none=True), status_code=404, media_type="application/json"
+            )
+            await response(scope, receive, send)
+
+
+streamable_session_manager = ProfileStreamableHTTPSessionManager(
+    app=mcp._mcp_server,
+    event_store=None,
+    retry_interval=None,
+    json_response=False,
+    stateless=False,
+    security_settings=None,
+)
+
+streamable_app = StreamableHTTPASGIApp(streamable_session_manager)
+
+@contextlib.asynccontextmanager
+async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    async with streamable_session_manager.run():
+        yield
+
 routes = [
+    Route("/mcp", endpoint=streamable_app),
     Route("/sse", endpoint=handle_sse, methods=["GET"]),
     Mount("/messages", app=sse_transport.handle_post_message),
 ]
 
-app = Starlette(routes=routes)
+app = Starlette(routes=routes, lifespan=lifespan)
 
 def run():
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     host = os.environ.get("HOST", "0.0.0.0")
-    logger.info(f"Starting MCP SSE Server on http://{host}:{port}")
+    logger.info(f"Starting MCP Server (SSE on /sse, Streamable HTTP on /mcp) on http://{host}:{port}")
     uvicorn.run(app, host=host, port=port)
 
 if __name__ == "__main__":

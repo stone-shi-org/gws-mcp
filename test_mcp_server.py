@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import pytest
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
+import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -228,6 +229,50 @@ class TestGetProfileName:
         assert result == "my_profile"
         del mcp_server.session_to_profile["abc123"]
 
+    @pytest.mark.asyncio
+    async def test_returns_profile_for_mapped_session_via_header(self):
+        mock_ctx = Mock()
+        mock_request = Mock()
+        mock_request.headers = {"mcp-session-id": "header_sess_456"}
+        mock_request.query_params = {}
+        mock_ctx.request_context.request = mock_request
+        mcp_server.session_to_profile["header_sess_456"] = "header_profile"
+        result = await mcp_server.get_profile_name(mock_ctx)
+        assert result == "header_profile"
+        del mcp_server.session_to_profile["header_sess_456"]
+
+
+class TestExtractTokenFromRequest:
+    def test_extracts_token_from_query_params(self):
+        mock_request = Mock()
+        mock_request.query_params = {"token": "token_abc"}
+        mock_request.headers = {}
+        assert mcp_server.extract_token_from_request(mock_request) == "token_abc"
+
+    def test_extracts_token_from_bearer_authorization_header(self):
+        mock_request = Mock()
+        mock_request.query_params = {}
+        mock_request.headers = {"authorization": "Bearer token_xyz"}
+        assert mcp_server.extract_token_from_request(mock_request) == "token_xyz"
+
+    def test_extracts_token_with_case_insensitive_bearer(self):
+        mock_request = Mock()
+        mock_request.query_params = {}
+        mock_request.headers = {"authorization": "bearer  token_123 "}
+        assert mcp_server.extract_token_from_request(mock_request) == "token_123"
+
+    def test_returns_none_when_no_token_provided(self):
+        mock_request = Mock()
+        mock_request.query_params = {}
+        mock_request.headers = {}
+        assert mcp_server.extract_token_from_request(mock_request) is None
+
+    def test_returns_none_when_authorization_not_bearer(self):
+        mock_request = Mock()
+        mock_request.query_params = {}
+        mock_request.headers = {"authorization": "Basic dXNlcjpwYXNz"}
+        assert mcp_server.extract_token_from_request(mock_request) is None
+
 
 class TestGetProfileCredentialsWithScope:
     def setup_method(self):
@@ -270,3 +315,199 @@ class TestServerInstructions:
         text = mcp_server.SERVER_INSTRUCTIONS
         assert "google_drive_list_files" in text
         assert "google_tasks_delete_task" in text
+
+
+class TestStreamableHTTPTransport:
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        os.makedirs("profiles/test_user", exist_ok=True)
+        with open("profiles/test_user/.env", "w") as f:
+            f.write("PROFILE_TOKEN=secret_token_123\n")
+
+    def teardown_method(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.test_dir)
+        mcp_server.session_to_profile.clear()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_when_token_missing(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                resp = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+                assert resp.status_code == 401
+                assert "Unauthorized: Missing token" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_when_token_invalid(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                resp = await client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                    headers={"Authorization": "Bearer wrong_token"},
+                )
+                assert resp.status_code == 401
+                assert "Unauthorized: Invalid token" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_session_creation_with_bearer_token(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                init_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "1.0"},
+                    },
+                }
+                resp = await client.post(
+                    "/mcp",
+                    json=init_payload,
+                    headers={
+                        "Authorization": "Bearer secret_token_123",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                assert resp.status_code == 200
+                session_id = resp.headers.get("mcp-session-id")
+                assert session_id is not None
+                assert mcp_server.session_to_profile.get(session_id) == "test_user"
+
+    @pytest.mark.asyncio
+    async def test_session_creation_with_query_param_token(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                init_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "1.0"},
+                    },
+                }
+                resp = await client.post(
+                    "/mcp?token=secret_token_123",
+                    json=init_payload,
+                    headers={"Accept": "application/json, text/event-stream"},
+                )
+                assert resp.status_code == 200
+                session_id = resp.headers.get("mcp-session-id")
+                assert session_id is not None
+                assert mcp_server.session_to_profile.get(session_id) == "test_user"
+
+    @pytest.mark.asyncio
+    async def test_existing_session_tool_list_and_delete(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                # 1. Initialize
+                init_resp = await client.post(
+                    "/mcp",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {"name": "test-client", "version": "1.0"},
+                        },
+                    },
+                    headers={
+                        "Authorization": "Bearer secret_token_123",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                assert init_resp.status_code == 200
+                session_id = init_resp.headers.get("mcp-session-id")
+
+                # 2. Initialized notification
+                notif_resp = await client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    headers={
+                        "mcp-session-id": session_id,
+                        "Authorization": "Bearer secret_token_123",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                assert notif_resp.status_code == 202
+
+                # 3. List tools
+                list_resp = await client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                    headers={
+                        "mcp-session-id": session_id,
+                        "Authorization": "Bearer secret_token_123",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                assert list_resp.status_code == 200
+                assert "google_drive_list_files" in list_resp.text
+
+                # 4. DELETE session terminates and cleans up
+                del_resp = await client.delete(
+                    "/mcp",
+                    headers={
+                        "mcp-session-id": session_id,
+                        "Authorization": "Bearer secret_token_123",
+                    },
+                )
+                assert del_resp.status_code == 200
+                assert session_id not in mcp_server.session_to_profile
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_id_returns_404(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                resp = await client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers={
+                        "mcp-session-id": "nonexistent_session_id",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                assert resp.status_code == 404
+
+
+class TestTransportCoexistence:
+    def test_routes_configured_on_starlette_app(self):
+        paths = [route.path for route in mcp_server.app.routes]
+        assert "/mcp" in paths
+        assert "/sse" in paths
+        assert "/messages" in paths
+
+    @pytest.mark.asyncio
+    async def test_both_endpoints_accessible_on_same_app(self):
+        async with mcp_server.streamable_session_manager.run():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+            ) as client:
+                # SSE endpoint rejects unauthenticated GET
+                sse_resp = await client.get("/sse")
+                assert sse_resp.status_code == 401
+
+                # Streamable HTTP endpoint rejects unauthenticated POST
+                mcp_resp = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+                assert mcp_resp.status_code == 401
+

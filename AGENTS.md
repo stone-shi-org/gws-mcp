@@ -9,38 +9,39 @@ This document is a guide for developer agents working on this repository to main
 The codebase is written in Python using a hybrid architecture of the Anthropic `mcp` SDK and `Starlette`.
 
 ```
-                +----------------------------+
-                |     Starlette (HTTP)       |
-                +-------------+--------------+
-                              |
-                     /sse     |     /messages
-              (Validates token|    (Routes JSON-RPC
-               maps connection)    via session_id)
-                              |
-         +--------------------+--------------------+
-         |                                         |
-         v                                         v
-+----------------------------+            +----------------------------+
-|  sse.connect_sse (Gen ID)  |            |  sse.handle_post_message   |
-+------------+---------------+            +----------------------------+
-             |
-             v
-+------------+---------------+
-|  session_to_profile[ID]    |
-+------------+---------------+
-             |
-             v
-+------------+---------------+
-|     mcp.server.run()       |
-+----------------------------+
+                +-----------------------------------------+
+                |            Starlette (HTTP)             |
+                +--------------------+--------------------+
+                                     |
+                 +-------------------+-------------------+
+                 |                   |                   |
+               /sse              /messages             /mcp
+        (Validates token     (Routes JSON-RPC    (Streamable HTTP:
+         maps connection)     via session_id)    validates token,
+                 |                   |           manages sessions)
+                 v                   v                   |
+        +-----------------+ +-----------------+          |
+        | sse.connect_sse | | handle_post_msg |          |
+        +--------+--------+ +-----------------+          |
+                 |                                       |
+                 +-------------------+-------------------+
+                                     |
+                                     v
+                        +-------------------------+
+                        |  session_to_profile[ID] |
+                        +------------+------------+
+                                     |
+                                     v
+                        +-------------------------+
+                        |    mcp._mcp_server      |
+                        +-------------------------+
 ```
 
 ### 1. Multi-Tenant Session Routing
-To maintain stateless multi-profile behavior, we map active connection streams to their corresponding profiles in memory:
-- When a client issues a `GET /sse?token=<profile_token>` request, we authenticate the token against the `.env` files in `profiles/*/`.
-- Once authenticated, we wrap `SseServerTransport.connect_sse(...)`. This context manager generates a unique `session_id` (UUID). We detect the new key added to the transport's `_read_stream_writers` and map `session_id.hex` -> `profile_name` in a global dictionary `session_to_profile`.
-- In `mcp_server.py`, the tools get access to `Context` (`ctx`). We retrieve `ctx.request_context.request` (which is the incoming JSON-RPC POST request to `/messages`).
-- We read the `session_id` from the query parameters of this request, look it up in `session_to_profile`, and load the corresponding profile credentials.
+To maintain stateless multi-profile behavior, we map active connection streams/sessions to their corresponding profiles in memory:
+- **HTTP+SSE**: When a client issues a `GET /sse?token=<profile_token>` request (or `Authorization: Bearer <profile_token>`), we authenticate the token against `.env` files in `profiles/*/`. Once authenticated, `SseServerTransport.connect_sse(...)` generates a UUID mapped as `session_id.hex` -> `profile_name` in `session_to_profile`.
+- **Streamable HTTP**: When a client issues a `POST /mcp` initialization request (or `GET /mcp`), `ProfileStreamableHTTPSessionManager` validates the token, generates a session ID, and maps `session_id` -> `profile_name` in `session_to_profile`. Subsequent requests provide the `mcp-session-id` header.
+- In `mcp_server.py`, tool handlers retrieve the current profile via `get_profile_name(ctx)`. `get_profile_name` extracts `session_id` from either the `mcp-session-id` header (Streamable HTTP) or query parameters (`session_id` in SSE), looks it up in `session_to_profile`, and loads the corresponding profile credentials.
 
 ### 2. File Caching & Temp Files
 - As per security and isolation rules, all temporary files must be under `profiles/<profile_name>/`.
