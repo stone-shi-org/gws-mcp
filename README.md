@@ -124,6 +124,14 @@ For backwards compatibility with existing clients that use SSE:
 *   **SSE Handshake Endpoint**: `GET /sse` (e.g. `http://localhost:8000/sse?token=<profile_token>` or `Authorization: Bearer <profile_token>`)
 *   **Messages Endpoint**: `POST /messages?session_id=<session_id>`
 
+### 3. Retrieving Cached/Exported Files
+
+`google_drive_download_file` and `google_drive_export_file` write files to this server's own `profiles/<profile_name>/cache/` folder and return that as `local_path` — which is only meaningful if your client shares a filesystem/volume with this server. To actually fetch a file's bytes over the network (e.g. from a client running elsewhere), use the `download_path` field from either tool's response:
+
+*   **Endpoint**: `GET /files/{cache_key}` (`cache_key` is the last path segment of `download_path`, e.g. `http://localhost:8000/files/<cache_key>?token=<profile_token>`)
+*   **Authentication**: Same as `/sse` and `/mcp` — a `token` query parameter or `Authorization: Bearer <profile_token>` header.
+*   Returns the raw file bytes with a `Content-Type` derived from the file's (export) mimeType and a `Content-Disposition` filename from its original Drive name.
+
 ---
 
 ## Available Tools
@@ -134,6 +142,7 @@ For backwards compatibility with existing clients that use SSE:
 *   `google_drive_upload_file(local_file_path: str, name: str = None, parent_id: str = None)`: Upload a local file.
 *   `google_drive_download_file(file_id: str, use_cache: bool = True)`: Download a file to cache and returns local filepath.
     *   *Note: Files are cached locally under `profiles/<profile_name>/cache/` based on file ID, matching size, and MD5 checksum.*
+    *   The response also includes a `download_path` — see [Retrieving Cached/Exported Files](#3-retrieving-cachedexported-files) to actually fetch the bytes if your client doesn't share this server's filesystem.
 *   `google_drive_export_file(file_id: str, export_format: str, use_cache: bool = True)`: Export a Google-Apps-native file (Doc/Sheet/Slide/Drawing/Apps Script) to another format (e.g. PDF, DOCX, XLSX, CSV, PPTX, PNG), and cache the result locally.
     *   Use this instead of `google_drive_download_file` for files whose `mimeType` starts with `application/vnd.google-apps.*` — those have no raw binary content, so `google_drive_download_file` fails with `403 fileNotDownloadable` on them.
     *   Supported `export_format` values depend on the source file's type; an unsupported value returns an error listing the valid options for that file. See [Google's export format reference](https://developers.google.com/drive/api/guides/ref-export-formats) for the authoritative, up-to-date list:
@@ -144,6 +153,7 @@ For backwards compatibility with existing clients that use SSE:
         *   **Apps Script**: json
         *   \* CSV/TSV (Sheets) and image exports (Slides/Drawings) only cover the first/active sheet or slide — the response includes `single_sheet_or_slide_only: true` as a reminder.
     *   Drive enforces a hard 10 MB limit on exported output; oversized exports return a clear error suggesting a smaller subset or a lower-fidelity format.
+    *   The response also includes a `download_path` — see [Retrieving Cached/Exported Files](#3-retrieving-cachedexported-files) to actually fetch the bytes if your client doesn't share this server's filesystem.
     *   *Note: Unlike `google_drive_download_file`, exported bytes have no Drive-side checksum, so the cache is keyed on the source document's `modifiedTime` plus the requested format (`profiles/<profile_name>/cache/<file_id>.export.<format>`), not on `file_id` alone.*
 *   `google_drive_create_folder(name: str, parent_id: str = None)`: Create a folder in Drive.
 *   `google_drive_copy_file(file_id: str, name: str = None, parent_id: str = None)`: Copy a file in Drive.

@@ -15,7 +15,7 @@ import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
+from starlette.responses import Response, JSONResponse, FileResponse
 from starlette.types import Scope, Receive, Send
 from dotenv import dotenv_values
 
@@ -272,6 +272,36 @@ def get_profile_cache_dir(profile_name: str) -> str:
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
+# Helper: Resolve a cache_key (as returned by google_drive_download_file /
+# google_drive_export_file in their "download_path" field) to an absolute
+# path inside a profile's cache dir, for serving over GET /files/{cache_key}.
+def resolve_cache_file_path(profile_name: str, cache_key: str) -> str:
+    """Validate cache_key and resolve it to an absolute path within the
+    profile's cache directory.
+
+    Raises:
+        ValueError: If cache_key attempts to escape the cache directory
+            (e.g. contains path separators, '..', or resolves outside it).
+        FileNotFoundError: If the resolved file does not exist.
+    """
+    # Reject any path-like input outright; cache_key must be a bare filename.
+    if not cache_key or cache_key in (os.curdir, os.pardir) or os.path.basename(cache_key) != cache_key:
+        raise ValueError(f"Invalid cache_key: '{cache_key}'")
+
+    cache_dir = get_profile_cache_dir(profile_name)
+    candidate_path = os.path.realpath(os.path.join(cache_dir, cache_key))
+    real_cache_dir = os.path.realpath(cache_dir)
+
+    # Defense in depth against any path-traversal that slipped past the
+    # basename check above (e.g. via symlinks).
+    if os.path.commonpath([real_cache_dir, candidate_path]) != real_cache_dir:
+        raise ValueError(f"Invalid cache_key: '{cache_key}'")
+
+    if not os.path.isfile(candidate_path):
+        raise FileNotFoundError(f"No cached file found for cache_key '{cache_key}'")
+
+    return candidate_path
+
 # Helper: Extract profile token from HTTP request
 def extract_token_from_request(request: Request) -> Optional[str]:
     """Extract profile authentication token from query parameters or Authorization header."""
@@ -372,10 +402,18 @@ async def google_drive_search_files(ctx: Context, name: str) -> str:
 @mcp.tool()
 async def google_drive_download_file(ctx: Context, file_id: str, use_cache: bool = True) -> str:
     """Download a file from Google Drive, saving it inside the profile's cache folder.
-    
+
     Args:
         file_id: The Google Drive file ID.
         use_cache: If True, uses the cached file if size & MD5 checksum match (default: True).
+
+    Note:
+        "local_path" is a path on the MCP *server's* filesystem -- only
+        useful if your client shares that filesystem/volume. To actually
+        retrieve the file's bytes over the network, GET the "download_path"
+        returned below (e.g. "https://<server>{download_path}"), authenticating
+        the same way you authenticate your MCP connection (a "token" query
+        param or "Authorization: Bearer <token>" header).
     """
     try:
         profile_name = await get_profile_name(ctx)
@@ -413,10 +451,11 @@ async def google_drive_download_file(ctx: Context, file_id: str, use_cache: bool
                 "message": "File retrieved from cache.",
                 "file_name": file_name,
                 "local_path": cached_file_path,
+                "download_path": f"/files/{file_id}",
                 "size_bytes": file_size,
                 "cached": True
             }, indent=2)
-            
+
         # Download from API
         from googleapiclient.http import MediaIoBaseDownload
         import io
@@ -447,6 +486,7 @@ async def google_drive_download_file(ctx: Context, file_id: str, use_cache: bool
             "message": "File downloaded successfully.",
             "file_name": file_name,
             "local_path": cached_file_path,
+            "download_path": f"/files/{file_id}",
             "size_bytes": file_size,
             "cached": False
         }, indent=2)
@@ -472,6 +512,12 @@ async def google_drive_export_file(ctx: Context, file_id: str, export_format: st
             document's modifiedTime hasn't changed (default: True).
 
     Notes:
+        - "local_path" is a path on the MCP *server's* filesystem -- only
+          useful if your client shares that filesystem/volume. To actually
+          retrieve the exported file's bytes over the network, GET the
+          "download_path" returned below (e.g. "https://<server>{download_path}"),
+          authenticating the same way you authenticate your MCP connection (a
+          "token" query param or "Authorization: Bearer <token>" header).
         - Drive enforces a hard 10 MB limit on exported output; very large
           Docs/Sheets/Slides may fail to export at all. Try a smaller subset
           or a lower-fidelity format (e.g. txt/csv instead of docx/xlsx).
@@ -522,6 +568,7 @@ async def google_drive_export_file(ctx: Context, file_id: str, export_format: st
                 "message": "Exported file retrieved from cache.",
                 "file_name": file_name,
                 "local_path": cached_file_path,
+                "download_path": f"/files/{cache_key}",
                 "export_mime_type": target_mime,
                 "cached": True,
                 "single_sheet_or_slide_only": normalized_format in SINGLE_SHEET_OR_SLIDE_FORMATS,
@@ -568,6 +615,7 @@ async def google_drive_export_file(ctx: Context, file_id: str, export_format: st
             "message": "File exported successfully.",
             "file_name": file_name,
             "local_path": cached_file_path,
+            "download_path": f"/files/{cache_key}",
             "export_mime_type": target_mime,
             "cached": False,
             "single_sheet_or_slide_only": normalized_format in SINGLE_SHEET_OR_SLIDE_FORMATS,
@@ -1552,6 +1600,52 @@ async def handle_sse(request: Request):
     return Response()
 
 
+async def handle_file_download(request: Request) -> Response:
+    """Serve a previously downloaded/exported Drive file's bytes to an MCP client.
+
+    google_drive_download_file / google_drive_export_file write files under
+    profiles/<profile>/cache/ on the server's own filesystem and return a
+    "download_path" of the form "/files/<cache_key>" pointing here -- tool
+    responses are text-only, so this is the only way for a client that
+    doesn't share a filesystem/volume with this server to retrieve the
+    actual bytes. Authenticated the same way as /sse and /mcp: a profile
+    token via query param or Authorization: Bearer header (GM-4).
+    """
+    token = extract_token_from_request(request)
+    if not token:
+        return Response("Unauthorized: Missing token", status_code=401)
+
+    profile_name = get_profile_by_token(token)
+    if not profile_name:
+        return Response("Unauthorized: Invalid token", status_code=401)
+
+    cache_key = request.path_params.get("cache_key", "")
+    try:
+        file_path = resolve_cache_file_path(profile_name, cache_key)
+    except ValueError as ve:
+        return Response(f"Bad Request: {str(ve)}", status_code=400)
+    except FileNotFoundError:
+        return Response("Not Found: No cached file matches that cache_key.", status_code=404)
+
+    # Metadata sidecar (written by google_drive_download_file /
+    # google_drive_export_file) carries the original file name and mimeType,
+    # used to set a sensible Content-Type/Content-Disposition. Best-effort:
+    # fall back to generic values if it's missing or unreadable.
+    file_name = cache_key
+    media_type = "application/octet-stream"
+    metadata_path = f"{file_path}.json"
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r") as f:
+                meta = json.load(f)
+            file_name = meta.get("name") or file_name
+            media_type = meta.get("export_mime_type") or meta.get("mimeType") or media_type
+        except Exception:
+            logger.warning(f"Could not read cache metadata sidecar '{metadata_path}'", exc_info=True)
+
+    return FileResponse(file_path, media_type=media_type, filename=file_name)
+
+
 class ProfileStreamableHTTPSessionManager(StreamableHTTPSessionManager):
     """Session manager that authenticates Streamable HTTP connections against profile tokens."""
 
@@ -1713,6 +1807,7 @@ routes = [
     Route("/mcp", endpoint=streamable_app),
     Route("/sse", endpoint=handle_sse, methods=["GET"]),
     Mount("/messages", app=sse_transport.handle_post_message),
+    Route("/files/{cache_key}", endpoint=handle_file_download, methods=["GET"]),
 ]
 
 app = Starlette(routes=routes, lifespan=lifespan)

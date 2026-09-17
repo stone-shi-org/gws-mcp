@@ -189,6 +189,54 @@ class TestGetProfileCacheDir:
         assert cache_dir.endswith("cache")
 
 
+class TestResolveCacheFilePath:
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        self.cache_dir = mcp_server.get_profile_cache_dir("test_profile")
+
+    def teardown_method(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.test_dir)
+
+    def _write_cache_file(self, cache_key, content=b"hello"):
+        path = os.path.join(self.cache_dir, cache_key)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    def test_resolves_existing_file(self):
+        expected_path = self._write_cache_file("file123")
+        result = mcp_server.resolve_cache_file_path("test_profile", "file123")
+        assert os.path.realpath(result) == os.path.realpath(expected_path)
+
+    def test_resolves_export_style_cache_key(self):
+        expected_path = self._write_cache_file("file123.export.pdf")
+        result = mcp_server.resolve_cache_file_path("test_profile", "file123.export.pdf")
+        assert os.path.realpath(result) == os.path.realpath(expected_path)
+
+    def test_raises_file_not_found_when_missing(self):
+        with pytest.raises(FileNotFoundError):
+            mcp_server.resolve_cache_file_path("test_profile", "does_not_exist")
+
+    def test_rejects_empty_cache_key(self):
+        with pytest.raises(ValueError):
+            mcp_server.resolve_cache_file_path("test_profile", "")
+
+    def test_rejects_path_traversal_with_dotdot(self):
+        with pytest.raises(ValueError):
+            mcp_server.resolve_cache_file_path("test_profile", "../../etc/passwd")
+
+    def test_rejects_nested_path_separators(self):
+        with pytest.raises(ValueError):
+            mcp_server.resolve_cache_file_path("test_profile", "subdir/file123")
+
+    def test_rejects_bare_dotdot(self):
+        with pytest.raises(ValueError):
+            mcp_server.resolve_cache_file_path("test_profile", "..")
+
+
 class TestGetProfileName:
     @pytest.mark.asyncio
     async def test_returns_default_profile_when_no_request_context(self):
@@ -784,6 +832,113 @@ class TestStreamableHTTPTransport:
                     },
                 )
                 assert resp.status_code == 404
+
+
+class TestFileDownloadRoute:
+    """GM-4: GET /files/{cache_key} lets a remote MCP client retrieve the
+    bytes of a file previously written by google_drive_download_file /
+    google_drive_export_file, which otherwise only return a server-local
+    "local_path" the client has no way to read."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        os.makedirs("profiles/test_user", exist_ok=True)
+        with open("profiles/test_user/.env", "w") as f:
+            f.write("PROFILE_TOKEN=secret_token_123\n")
+        self.cache_dir = mcp_server.get_profile_cache_dir("test_user")
+
+    def teardown_method(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.test_dir)
+
+    def _write_cache_file(self, cache_key, content=b"file-bytes", metadata=None):
+        with open(os.path.join(self.cache_dir, cache_key), "wb") as f:
+            f.write(content)
+        if metadata is not None:
+            with open(os.path.join(self.cache_dir, f"{cache_key}.json"), "w") as f:
+                json.dump(metadata, f)
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_when_token_missing(self):
+        self._write_cache_file("file123")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get("/files/file123")
+            assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_when_token_invalid(self):
+        self._write_cache_file("file123")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get("/files/file123", headers={"Authorization": "Bearer wrong_token"})
+            assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_returns_404_for_missing_cache_key(self):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get("/files/does_not_exist", params={"token": "secret_token_123"})
+            assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_downloads_cached_file_bytes_with_query_token(self):
+        self._write_cache_file(
+            "file123",
+            content=b"hello world",
+            metadata={"name": "greeting.txt", "mimeType": "text/plain"},
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get("/files/file123", params={"token": "secret_token_123"})
+            assert resp.status_code == 200
+            assert resp.content == b"hello world"
+            assert resp.headers["content-type"].startswith("text/plain")
+            assert "greeting.txt" in resp.headers.get("content-disposition", "")
+
+    @pytest.mark.asyncio
+    async def test_downloads_exported_file_using_export_mime_type(self):
+        self._write_cache_file(
+            "file123.export.pdf",
+            content=b"%PDF-fake",
+            metadata={"name": "MyDoc", "mimeType": "application/vnd.google-apps.document", "export_mime_type": "application/pdf"},
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get(
+                "/files/file123.export.pdf",
+                headers={"Authorization": "Bearer secret_token_123"},
+            )
+            assert resp.status_code == 200
+            assert resp.content == b"%PDF-fake"
+            assert resp.headers["content-type"].startswith("application/pdf")
+
+    @pytest.mark.asyncio
+    async def test_rejects_path_traversal_cache_key(self):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get(
+                "/files/..%2F..%2Fetc%2Fpasswd", params={"token": "secret_token_123"}
+            )
+            assert resp.status_code in (400, 404)
+
+    @pytest.mark.asyncio
+    async def test_missing_metadata_sidecar_falls_back_to_generic_content_type(self):
+        self._write_cache_file("file123")  # no metadata sidecar written
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_server.app), base_url="http://testserver"
+        ) as client:
+            resp = await client.get("/files/file123", params={"token": "secret_token_123"})
+            assert resp.status_code == 200
+            assert resp.content == b"file-bytes"
 
 
 class TestTransportCoexistence:

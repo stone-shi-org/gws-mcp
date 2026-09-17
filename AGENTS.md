@@ -50,6 +50,12 @@ To maintain stateless multi-profile behavior, we map active connection streams/s
 - Before downloading, we compare local cached metadata against live Drive metadata. If it matches, we return the cached file's path instantly.
 - **Deliberate exception**: `google_drive_export_file` (Google-Apps-native file export, e.g. Doc -> PDF) caches at `profiles/<profile_name>/cache/<file_id>.export.<format>` (metadata sidecar: `...<format>.json`) instead of `<file_id>`, and keys its cache-validity check on the *source* document's `modifiedTime` instead of size/MD5. This is intentional, not an oversight — exported bytes have no Drive-side checksum/size to compare against, and the same source file can be exported to multiple formats, so `file_id` alone isn't a safe cache key. Do not "fix" this to match `google_drive_download_file`'s scheme.
 
+### 3. Serving Cached Files Back to Clients (GM-4)
+- All `@mcp.tool()` functions return plain text/JSON — there is no protocol-level way for a tool to return raw file bytes to an MCP client. `google_drive_download_file` / `google_drive_export_file` therefore only return a `local_path` on this server's own filesystem, which is meaningless to a client that doesn't share that filesystem/volume (e.g. a remote agent, or this server running in a different container than the caller).
+- `GET /files/{cache_key}` (`mcp_server.py`, `handle_file_download`) closes that gap: it resolves `cache_key` to a file under the caller's `profiles/<profile_name>/cache/` (authenticated the same way as `/sse`/`/mcp` — `token` query param or `Authorization: Bearer`) and streams it back via `FileResponse`, using the metadata sidecar (`mimeType`/`export_mime_type`, `name`) for `Content-Type`/`Content-Disposition`.
+- Both cache-writing tools include a `download_path` (`/files/<cache_key>`) in their JSON response specifically so callers know how to fetch the bytes — if you add another tool that caches a file, give it a `download_path` too rather than only a `local_path`.
+- `resolve_cache_file_path(profile_name, cache_key)` is the only path from an HTTP-supplied `cache_key` to a filesystem path — it rejects anything that isn't a bare filename (no separators, no `..`) and double-checks the resolved real path is still inside the profile's cache dir. Do not bypass it or reimplement path joining for this route.
+
 ---
 
 ## How to Extend This Codebase
